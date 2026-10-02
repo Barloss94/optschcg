@@ -20,7 +20,7 @@
 <dialog id="emailDialog"><form id="emailForm"><h2>E-mailadres wijzigen</h2><p class="hint" id="currentEmailText"></p><div class="fields"><div><label>Nieuw e-mailadres</label><input name="newEmail" type="email" autocomplete="email" required></div><div><label>Nieuw e-mailadres herhalen</label><input name="confirmEmail" type="email" autocomplete="off" required></div><div><label>Huidig wachtwoord</label><input name="currentPassword" type="password" autocomplete="current-password" required></div></div><p class="hint">Supabase stuurt een bevestigingslink naar je nieuwe adres. Als Secure email change in OPTSCH Ranking nog aanstaat, is ook bevestiging via je oude adres nodig. Je blijft ingelogd.</p><div class="modalactions"><button type="button" class="close">Annuleren</button><button class="primary">Bevestigingsmail versturen</button></div></form></dialog>
 <dialog id="sessionDialog"><form id="sessionForm"><h2 id="sessionTitle">Nieuwe sessie</h2><div class="fields"><div><label>Datum</label><input name="date" type="date" required></div><div><label>Gamecode</label><input name="code" placeholder="Bijv. 70608822" required></div><div><label>Speltype</label><input name="type" value="NL Hold'em"></div><div><label>Big blind (€)</label><input name="blind" type="number" min="0" step="0.01" value="0.10"></div><div><label>Werkelijke starttijd (handmatig)</label><input name="manualStart" type="datetime-local"></div><div><label>Einde (lokale tijd)</label><input name="ended" type="datetime-local"></div><div><label>Host</label><input name="host" list="playerNames" placeholder="Kies of typ een naam"></div><div><label>Tweede ontvanger rake</label><input name="partner" list="playerNames" placeholder="Kies of typ een naam"></div></div><datalist id="playerNames"></datalist><p class="hint">De starttijd uit Pokerrrr is het klaarzetmoment en wordt niet gebruikt. Vul de werkelijke start zelf in. Hostvergoeding: 12 goud voor de eerste 3 uur, daarna 3 goud per begonnen half uur, plus 1 goud voor de CSV-export. 115 goud kost € 20,99. De vergoeding gaat eerst van de tips af; de resterende rake wordt 50/50 verdeeld.</p><div class="modalactions"><button type="button" class="close">Annuleren</button><button class="primary">Sessie opslaan</button></div></form></dialog>
 <dialog id="playerDialog"><form id="playerForm"><h2 id="playerTitle">Spelerresultaat</h2><div class="fields"><div><label>Sessie</label><select name="session" id="playerSession" required></select></div><div><label>Speler</label><input name="name" required></div><div><label>Speler-ID (optioneel)</label><input name="playerId" placeholder="#ABCDE"></div><div><label>Handen</label><input name="hands" type="number" min="0" step="1" value="0" required></div><div><label>Buy-ins (€)</label><input name="buyIn" type="number" min="0" step="0.01" value="0" required></div><div><label>Resultaat (€)</label><input name="profit" type="number" step="0.01" value="0" required></div><div><label>Tips (€)</label><input name="tips" type="number" min="0" step="0.01" value="0"></div></div><p class="hint">Resultaat: positief bij winst, negatief bij verlies. Voer tips apart in als je ze wilt bijhouden.</p><div class="modalactions"><button type="button" class="close">Annuleren</button><button class="primary">Opslaan</button></div></form></dialog>
-<dialog id="rakebackDialog"><form id="rakebackForm"><h2>Rakebackactie</h2><div class="fields"><div><label>Naam</label><input name="name" required></div><div><label>Vanaf</label><input name="start" type="date" required></div><div><label>Tot en met</label><input name="end" type="date" required></div><div><label>Rakeback (%) na hostvergoeding</label><input name="percentage" type="number" min="0" max="100" step="0.01" required value="20"></div></div><p class="hint">Meerdere acties mogen dezelfde sessie gebruiken. Elk percentage geldt voor de rake na hostkosten; samen maximaal 100%. Reserveringen worden per actie per sessie naar beneden afgerond op centen. Nieuwe sessies worden niet automatisch toegevoegd aan een opgeslagen actie.</p><button type="button" id="selectRakebackPeriod">Selecteer alle sessies in periode</button><div id="rakebackChoices" style="margin-top:16px"></div><div class="modalactions"><button type="button" class="close">Annuleren</button><button class="primary">Opslaan</button></div></form></dialog><div id="toast" class="toast" role="status"></div>
+<dialog id="rakebackDialog"><form id="rakebackForm"><h2>Rakebackactie</h2><div class="fields"><div><label>Naam</label><input name="name" required></div><div><label>Vanaf</label><input name="start" type="date" required></div><div><label>Tot en met</label><input name="end" type="date" required></div><div><label>Rakeback (%) na hostvergoeding</label><input name="percentage" type="number" min="0" max="100" step="0.01" required value="20"></div><div><label>Betaalde spelers (%)</label><input name="paidPercentage" type="number" min="0.01" max="100" step="0.01" required value="20"></div></div><div class="row" style="margin-top:16px"><label><input style="width:auto" type="checkbox" name="pointsHands" checked> Handenpunten</label><label><input style="width:auto" type="checkbox" name="pointsRake" checked> Rakepunten</label><label><input style="width:auto" type="checkbox" name="pointsPosition" checked> Eindpositiepunten</label></div><p class="hint">Meerdere acties mogen dezelfde sessie gebruiken. Elk percentage geldt voor de rake na hostkosten; samen maximaal 100%. Reserveringen worden per actie per sessie naar beneden afgerond op centen. Nieuwe sessies worden niet automatisch toegevoegd aan een opgeslagen actie.</p><button type="button" id="selectRakebackPeriod">Selecteer alle sessies in periode</button><div id="rakebackChoices" style="margin-top:16px"></div><div class="modalactions"><button type="button" class="close">Annuleren</button><button class="primary">Opslaan</button></div></form></dialog><div id="toast" class="toast" role="status"></div>
 <script>
 'use strict';
 const API='https://lnlaqrljtwrxtfsyotnn.supabase.co';const PUBLIC_KEY='sb_publishable_wXilWOoEC4fEBswRNtnWAw_MRQ0AooI';const AUTH_KEY='cashgame-optsch-auth-v2';
@@ -75,24 +75,130 @@ $('#sessionAddPlayer').onclick=()=>$('#addPlayer').click();
 $('#sessionDelete').onclick=async()=>{let s=data.sessions.find(x=>x.id===routeSession());if(!s||!confirm(`Sessie ${s.code} van ${fmtDate(s.date)} en alle spelerresultaten verwijderen?`))return;await mutate(async()=>{await request('/rest/v1/cashgame_sessions?id=eq.'+encodeURIComponent(s.id),{method:'DELETE'});location.hash=''})};
 
 let editingRakeback=null;
+const getRakebackPayoutPercentages = (
+  paidPlaces
+) => {
+  const payoutMap = {
+    1: [100],
+    2: [65, 35],
+    3: [50, 30, 20],
+    4: [45, 25, 18, 12],
+    5: [40, 23, 16, 12, 9],
+    6: [35, 22, 16, 11, 9, 7],
+    7: [32, 21, 15, 11, 9, 7, 5],
+    8: [30, 20, 14, 11, 9, 7, 5, 4],
+    9: [
+      29,
+      19,
+      13,
+      11,
+      9,
+      7,
+      5,
+      4,
+      3
+    ],
+    10: [
+      28,
+      18,
+      13,
+      11,
+      9,
+      7,
+      5,
+      4,
+      3,
+      2
+    ],
+    11: [
+      27,
+      18,
+      12,
+      11,
+      9,
+      7,
+      5,
+      4,
+      3,
+      2,
+      2
+    ],
+    12: [
+      26,
+      17,
+      12,
+      10,
+      9,
+      7,
+      5,
+      4,
+      3,
+      3,
+      2,
+      2
+    ],
+    13: [
+      25,
+      17,
+      12,
+      10,
+      8,
+      7,
+      5,
+      4,
+      3,
+      3,
+      2,
+      2,
+      2
+    ],
+    14: [
+      24,
+      16,
+      12,
+      10,
+      8,
+      7,
+      5,
+      4,
+      3,
+      3,
+      2,
+      2,
+      2,
+      2
+    ]
+  };
+
+  return payoutMap[paidPlaces] || [];
+};
+
+
 function calculateRakeback(action){
  let rows=[],pending=[],people=new Map(),holders=new Map(),pot=0,totalTips=0;
  for(let s of data.sessions.filter(s=>action.session_ids.includes(s.id))){
   let rs=data.results.filter(r=>r.sessionId===s.id),a=sessionAccounting(s,rs);
   if(a.fee===null||!s.host?.trim()||a.fee>a.tips){pending.push(s);continue}
   let actionReserve=Math.floor(Math.max(0,a.tips-a.fee)*num(action.percentage)/100);a={...a,reserve:actionReserve};rows.push({s,a});pot+=actionReserve;holders.set(s.host,(holders.get(s.host)||0)+actionReserve);
-  for(let r of rs){let key=r.playerId?.toUpperCase()||r.name.trim().toLocaleLowerCase('nl'),p=people.get(key)||{key,name:r.name,tips:0,hands:0,sessions:new Set};p.tips+=moneyCents(r.tips);p.hands+=num(r.hands);p.sessions.add(s.id);people.set(key,p);totalTips+=moneyCents(r.tips)}
+  for(let r of rs){let key=r.playerId?.toUpperCase()||r.name.trim().toLocaleLowerCase('nl'),p=people.get(key)||{key,name:r.name,tips:0,hands:0,positionPoints:0,sessions:new Set};p.tips+=moneyCents(r.tips);p.hands+=num(r.hands);p.positionPoints+=1+rs.filter(other=>moneyCents(other.profit)<moneyCents(r.profit)).length;p.sessions.add(s.id);people.set(key,p);totalTips+=moneyCents(r.tips)}
  }
 
- let players=[...people.values()].map(p=>({...p,handPoints:Math.floor(p.hands/20),rakePoints:Math.floor(p.tips/50)}));
- for(let p of players)p.points=p.handPoints+p.rakePoints;
+ let players=[...people.values()].map(p=>({...p,handPoints:action.points_hands===false?0:Math.floor(p.hands/20),rakePoints:action.points_rake===false?0:Math.floor(p.tips/50),positionPoints:action.points_position===false?0:p.positionPoints}));
+ for(let p of players)p.points=p.handPoints+p.rakePoints+p.positionPoints;
  let totalPoints=players.reduce((sum,p)=>sum+p.points,0);
- for(let p of players){p.payout=totalPoints?Math.floor(pot*p.points/totalPoints):0;p.fraction=totalPoints?(pot*p.points)%totalPoints:0}
- let left=totalPoints?pot-players.reduce((n,p)=>n+p.payout,0):0;
- let order=[...players].sort((a,b)=>b.fraction-a.fraction||a.key.localeCompare(b.key));
- for(let i=0;i<left;i++)order[i].payout++;
+
  players.sort((a,b)=>b.points-a.points||a.name.localeCompare(b.name,'nl'));
- return {rows,pending,players,holders,pot,totalTips,totalPoints};
+ let paidPlaces=totalPoints?Math.ceil(players.length*num(action.paid_percentage??20)/100):0,percentages=getRakebackPayoutPercentages(paidPlaces),unsupported=paidPlaces>0&&!percentages.length;
+ let prizes=percentages.map(p=>Math.floor(pot*p/100)),remaining=pot-prizes.reduce((n,p)=>n+p,0);
+ if(prizes.length)for(let i=0;i<remaining;i++)prizes[i%prizes.length]++;
+ for(let i=0;i<players.length;){
+  let j=i+1;while(j<players.length&&players[j].points===players[i].points)j++;
+  let groupPot=prizes.slice(i,j).reduce((n,p)=>n+p,0),base=Math.floor(groupPot/(j-i)),rest=groupPot%(j-i);
+  let order=players.slice(i,j).sort((a,b)=>a.key.localeCompare(b.key));
+  order.forEach((p,k)=>{p.rank=i+1;p.payout=base+(k<rest?1:0)});
+  i=j;
+ }
+ return {rows,pending,players,holders,pot,totalTips,totalPoints,paidPlaces,percentages,unsupported};
 
 }
 function renderRakeback(){
@@ -104,8 +210,8 @@ function renderRakeback(){
  (v.pending.length?'<section class="panel"><p class="negative">Voorlopige pot en klassement: '+v.pending.length+' sessie(s) niet meegerekend wegens ontbrekende host/tijden of te weinig rake voor de hostvergoeding.</p></section>':'')+
  '<section class="panel"><h2>Deelnemende sessies</h2><div class="tablewrap"><table><thead><tr><th>Datum</th><th>Sessie</th><th>Host</th><th>Rake</th><th>Rakebackpot</th></tr></thead><tbody>'+
  data.sessions.filter(s=>action.session_ids.includes(s.id)).map(s=>{let r=v.rows.find(r=>r.s.id===s.id);return '<tr><td>'+fmtDate(s.date)+'</td><td><a href="#sessie/'+encodeURIComponent(s.id)+'">'+esc(s.code)+'</a></td><td>'+esc(s.host)+'</td><td>'+(r?euro(r.a.tips/100):'Onvolledig')+'</td><td>'+(r?euro(r.a.reserve/100):'—')+'</td></tr>'}).join('')+
- '</tbody></table></div></section><section class="panel"><h2>Rakebackklassement</h2><p class="hint">1 punt per volledige 20 handen + 1 punt per volledige €0,50 rake. Handen en rake worden eerst over alle berekende sessies van deze actie opgeteld. De pot wordt verdeeld naar totaalpunten.</p>'+(!v.totalPoints?'<p class="hint">Nog geen punten: de pot blijft gereserveerd tot er punten zijn.</p>':'')+'<div class="tablewrap"><table><thead><tr><th>#</th><th>Speler</th><th>Sessies</th><th>Handen</th><th>Handenpunten</th><th>Betaalde rake</th><th>Rakepunten</th><th>Totaal punten</th><th>Aandeel</th><th>Te ontvangen</th></tr></thead><tbody>'+
- v.players.map((p,i)=>'<tr><td>'+(i+1)+'</td><td>'+esc(p.name)+'</td><td>'+p.sessions.size+'</td><td>'+int(p.hands)+'</td><td>'+p.handPoints+'</td><td>'+euro(p.tips/100)+'</td><td>'+p.rakePoints+'</td><td><b>'+p.points+'</b></td><td>'+(v.totalPoints?100*p.points/v.totalPoints:0).toFixed(2)+'%</td><td class="positive">'+euro(p.payout/100)+'</td></tr>').join('')+
+ '</tbody></table></div></section><section class="panel"><h2>Rakebackklassement</h2><p class="hint">Ingeschakeld: '+[action.points_hands!==false?'handen':null,action.points_rake!==false?'rake':null,action.points_position!==false?'eindpositie':null].filter(Boolean).join(', ')+'. Alleen ingeschakelde onderdelen tellen. Handen: 1 punt per volledige 20; rake: 1 punt per volledige €0,50. Handen en rake worden eerst over alle berekende sessies van deze actie opgeteld. Per sessie: laatste plaats 1 punt, elke hogere plek +1, op basis van nettoresultaat. Gelijke sessieresultaten krijgen dezelfde punten. Het ingestelde percentage beste spelers (naar boven afgerond) ontvangt de OPTSCH-prijzenverdeling. Gelijke totaalpunten delen de prijzen van hun plaatsen.</p>'+(v.unsupported?'<p class="negative">Voor meer dan 14 betaalde plaatsen ontbreekt een OPTSCH-prijzentabel; de pot blijft gereserveerd.</p>':'<p class="hint">'+num(action.paid_percentage??20)+'% van de spelers · '+v.paidPlaces+' betaalde plaatsen · verdeling '+v.percentages.join(' / ')+'%</p>')+'<div class="tablewrap"><table><thead><tr><th>#</th><th>Speler</th><th>Sessies</th><th>Handen</th><th>Handenpunten</th><th>Betaalde rake</th><th>Rakepunten</th><th>Positiepunten</th><th>Totaal punten</th><th>Prijs</th><th>Te ontvangen</th></tr></thead><tbody>'+
+ v.players.map((p,i)=>'<tr><td>'+p.rank+'</td><td>'+esc(p.name)+'</td><td>'+p.sessions.size+'</td><td>'+int(p.hands)+'</td><td>'+p.handPoints+'</td><td>'+euro(p.tips/100)+'</td><td>'+p.rakePoints+'</td><td>'+p.positionPoints+'</td><td><b>'+p.points+'</b></td><td>'+(p.payout>0?'Betaalde plaats':'—')+'</td><td class="positive">'+euro(p.payout/100)+'</td></tr>').join('')+
  '</tbody></table></div></section><section class="panel"><h2>Rakeback in bezit van hosts</h2>'+[...v.holders].map(([name,amount])=>'<p>'+esc(name)+': <b>'+euro(amount/100)+'</b></p>').join('')+'</section>';
 }
 function rakebackChoices(selectAll=false){
@@ -116,14 +222,14 @@ function rakebackChoices(selectAll=false){
  }).join('')||'<p class="hint">Geen sessies binnen deze periode.</p>';
 }
 function openRakeback(a){
- editingRakeback=a?.id||null;let f=$('#rakebackForm');f.reset();f.elements.name.value=a?.name||'';f.elements.start.value=a?.start_date||new Date().toLocaleDateString('sv-SE');f.elements.end.value=a?.end_date||f.elements.start.value;f.elements.percentage.value=a?.percentage??20;
+ editingRakeback=a?.id||null;let f=$('#rakebackForm');f.reset();f.elements.name.value=a?.name||'';f.elements.start.value=a?.start_date||new Date().toLocaleDateString('sv-SE');f.elements.end.value=a?.end_date||f.elements.start.value;f.elements.percentage.value=a?.percentage??20;f.elements.paidPercentage.value=a?.paid_percentage??20;f.elements.pointsHands.checked=a?.points_hands!==false;f.elements.pointsRake.checked=a?.points_rake!==false;f.elements.pointsPosition.checked=a?.points_position!==false;
  $('#rakebackChoices').innerHTML='';rakebackChoices(!a);if(a)document.querySelectorAll('[name="rbSession"]').forEach(x=>x.checked=a.session_ids.includes(x.value));$('#rakebackDialog').showModal();
 }
 $('#newRakeback').onclick=()=>openRakeback(null);
 $('#rakebackContent').onclick=e=>{let b=e.target.closest('[data-rb-edit]');if(b)openRakeback(data.actions.find(a=>a.id===b.dataset.rbEdit))};
 $('#selectRakebackPeriod').onclick=()=>rakebackChoices(true);
 $('#rakebackForm').elements.start.onchange=()=>rakebackChoices(true);$('#rakebackForm').elements.end.onchange=()=>rakebackChoices(true);
-$('#rakebackForm').onsubmit=async e=>{e.preventDefault();let f=e.target.elements;if(f.end.value<f.start.value){alert('Einddatum moet op of na startdatum liggen.');return}let ids=[...document.querySelectorAll('[name="rbSession"]:checked')].map(x=>x.value);if(!ids.length){alert('Selecteer minimaal één sessie.');return}let id=editingRakeback||uid();await mutate(async()=>{await request('/rest/v1/rpc/save_cashgame_rakeback',{method:'POST',body:JSON.stringify({p_id:id,p_name:f.name.value.trim(),p_start:f.start.value,p_end:f.end.value,p_percentage:num(f.percentage.value),p_sessions:ids})});$('#rakebackDialog').close();location.hash='rakeback/'+encodeURIComponent(id)})};
+$('#rakebackForm').onsubmit=async e=>{e.preventDefault();let f=e.target.elements;if(f.end.value<f.start.value){alert('Einddatum moet op of na startdatum liggen.');return}if(!f.pointsHands.checked&&!f.pointsRake.checked&&!f.pointsPosition.checked){alert('Kies minimaal één puntentelling.');return}let ids=[...document.querySelectorAll('[name="rbSession"]:checked')].map(x=>x.value);if(!ids.length){alert('Selecteer minimaal één sessie.');return}let id=editingRakeback||uid();await mutate(async()=>{await request('/rest/v1/rpc/save_cashgame_rakeback',{method:'POST',body:JSON.stringify({p_id:id,p_name:f.name.value.trim(),p_start:f.start.value,p_end:f.end.value,p_percentage:num(f.percentage.value),p_sessions:ids,p_paid_percentage:num(f.paidPercentage.value),p_points_hands:f.pointsHands.checked,p_points_rake:f.pointsRake.checked,p_points_position:f.pointsPosition.checked})});$('#rakebackDialog').close();location.hash='rakeback/'+encodeURIComponent(id)})};
 
 lock('Log in met je OPTSCH Ranking-account om cashgames te bekijken.');try{auth=JSON.parse(localStorage.getItem(AUTH_KEY)||'null');if(auth?.access_token)void connect()}catch{auth=null;localStorage.removeItem(AUTH_KEY)}
 
