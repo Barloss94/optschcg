@@ -81,14 +81,19 @@ function calculateRakeback(action){
   let rs=data.results.filter(r=>r.sessionId===s.id),a=sessionAccounting(s,rs);
   if(a.fee===null||!s.host?.trim()||a.fee>a.tips){pending.push(s);continue}
   let actionReserve=Math.floor(Math.max(0,a.tips-a.fee)*num(action.percentage)/100);a={...a,reserve:actionReserve};rows.push({s,a});pot+=actionReserve;holders.set(s.host,(holders.get(s.host)||0)+actionReserve);
-  for(let r of rs){let key=r.playerId?.toUpperCase()||r.name.trim().toLocaleLowerCase('nl'),p=people.get(key)||{key,name:r.name,tips:0,sessions:new Set};p.tips+=moneyCents(r.tips);p.sessions.add(s.id);people.set(key,p);totalTips+=moneyCents(r.tips)}
+  for(let r of rs){let key=r.playerId?.toUpperCase()||r.name.trim().toLocaleLowerCase('nl'),p=people.get(key)||{key,name:r.name,tips:0,hands:0,sessions:new Set};p.tips+=moneyCents(r.tips);p.hands+=num(r.hands);p.sessions.add(s.id);people.set(key,p);totalTips+=moneyCents(r.tips)}
  }
- let players=[...people.values()].map(p=>({...p,payout:totalTips?Math.floor(pot*p.tips/totalTips):0,fraction:totalTips?(pot*p.tips)%totalTips:0}));
- let left=pot-players.reduce((n,p)=>n+p.payout,0);
+
+ let players=[...people.values()].map(p=>({...p,handPoints:Math.floor(p.hands/20),rakePoints:Math.floor(p.tips/50)}));
+ for(let p of players)p.points=p.handPoints+p.rakePoints;
+ let totalPoints=players.reduce((sum,p)=>sum+p.points,0);
+ for(let p of players){p.payout=totalPoints?Math.floor(pot*p.points/totalPoints):0;p.fraction=totalPoints?(pot*p.points)%totalPoints:0}
+ let left=totalPoints?pot-players.reduce((n,p)=>n+p.payout,0):0;
  let order=[...players].sort((a,b)=>b.fraction-a.fraction||a.key.localeCompare(b.key));
  for(let i=0;i<left;i++)order[i].payout++;
- players.sort((a,b)=>b.tips-a.tips||a.name.localeCompare(b.name,'nl'));
- return {rows,pending,players,holders,pot,totalTips};
+ players.sort((a,b)=>b.points-a.points||a.name.localeCompare(b.name,'nl'));
+ return {rows,pending,players,holders,pot,totalTips,totalPoints};
+
 }
 function renderRakeback(){
  let id;try{id=location.hash.startsWith('#rakeback/')?decodeURIComponent(location.hash.slice(10)):null}catch{id=null}
@@ -99,8 +104,8 @@ function renderRakeback(){
  (v.pending.length?'<section class="panel"><p class="negative">Voorlopige pot en klassement: '+v.pending.length+' sessie(s) niet meegerekend wegens ontbrekende host/tijden of te weinig rake voor de hostvergoeding.</p></section>':'')+
  '<section class="panel"><h2>Deelnemende sessies</h2><div class="tablewrap"><table><thead><tr><th>Datum</th><th>Sessie</th><th>Host</th><th>Rake</th><th>Rakebackpot</th></tr></thead><tbody>'+
  data.sessions.filter(s=>action.session_ids.includes(s.id)).map(s=>{let r=v.rows.find(r=>r.s.id===s.id);return '<tr><td>'+fmtDate(s.date)+'</td><td><a href="#sessie/'+encodeURIComponent(s.id)+'">'+esc(s.code)+'</a></td><td>'+esc(s.host)+'</td><td>'+(r?euro(r.a.tips/100):'Onvolledig')+'</td><td>'+(r?euro(r.a.reserve/100):'—')+'</td></tr>'}).join('')+
- '</tbody></table></div></section><section class="panel"><h2>Rakebackklassement</h2><div class="tablewrap"><table><thead><tr><th>#</th><th>Speler</th><th>Sessies</th><th>Betaalde rake</th><th>Aandeel</th><th>Te ontvangen</th></tr></thead><tbody>'+
- v.players.map((p,i)=>'<tr><td>'+(i+1)+'</td><td>'+esc(p.name)+'</td><td>'+p.sessions.size+'</td><td>'+euro(p.tips/100)+'</td><td>'+(v.totalTips?100*p.tips/v.totalTips:0).toFixed(2)+'%</td><td class="positive">'+euro(p.payout/100)+'</td></tr>').join('')+
+ '</tbody></table></div></section><section class="panel"><h2>Rakebackklassement</h2><p class="hint">1 punt per volledige 20 handen + 1 punt per volledige €0,50 rake. Handen en rake worden eerst over alle berekende sessies van deze actie opgeteld. De pot wordt verdeeld naar totaalpunten.</p>'+(!v.totalPoints?'<p class="hint">Nog geen punten: de pot blijft gereserveerd tot er punten zijn.</p>':'')+'<div class="tablewrap"><table><thead><tr><th>#</th><th>Speler</th><th>Sessies</th><th>Handen</th><th>Handenpunten</th><th>Betaalde rake</th><th>Rakepunten</th><th>Totaal punten</th><th>Aandeel</th><th>Te ontvangen</th></tr></thead><tbody>'+
+ v.players.map((p,i)=>'<tr><td>'+(i+1)+'</td><td>'+esc(p.name)+'</td><td>'+p.sessions.size+'</td><td>'+int(p.hands)+'</td><td>'+p.handPoints+'</td><td>'+euro(p.tips/100)+'</td><td>'+p.rakePoints+'</td><td><b>'+p.points+'</b></td><td>'+(v.totalPoints?100*p.points/v.totalPoints:0).toFixed(2)+'%</td><td class="positive">'+euro(p.payout/100)+'</td></tr>').join('')+
  '</tbody></table></div></section><section class="panel"><h2>Rakeback in bezit van hosts</h2>'+[...v.holders].map(([name,amount])=>'<p>'+esc(name)+': <b>'+euro(amount/100)+'</b></p>').join('')+'</section>';
 }
 function rakebackChoices(selectAll=false){
