@@ -259,7 +259,7 @@ function calculateBonus(action){
   order.forEach((p,k)=>{p.rank=i+1;p.payout=base+(k<rest?1:0)});
   i=j;
  }
- return {rows,pending,players,holders,pot,totalBijdrage,totalPoints,paidPlaces,percentages,unsupported};
+ return {rows,pending,players,holders,pot,totalTips,totalPoints,paidPlaces,percentages,unsupported};
 
 }
 function renderBonus(){
