@@ -381,3 +381,96 @@ begin
 end $function$
 ;
 notify pgrst,'reload schema';
+
+-- Explicitly authorized protection of confirmed jackpot accounting.
+-- Protect confirmed jackpot accounting. A manager must reopen affected months first.
+create function cashgame_private.require_open_jackpot_month(p_date date) returns void
+language plpgsql security definer set search_path='' as $$
+declare frozen date; start_month date;
+begin
+ if auth.uid() is null or not public.is_cashgame_manager() then raise exception 'Geen toegang';end if;
+ if p_date is null then return;end if;
+ perform pg_advisory_xact_lock(769423);
+ select date_trunc('month',start_date)::date into start_month from public.cashgame_jackpot_settings where id=1;
+ if p_date<start_month then return;end if;
+ select month into frozen from public.cashgame_month_settlements
+ where status='completed' and snapshot?'jackpotCustody' and p_date<month+interval '1 month'
+ order by month desc limit 1;
+ if frozen is not null then
+  raise exception 'Wijziging geblokkeerd: jackpotmaand % is al bevestigd. Open Maandoverzicht, kies deze maand en klik Opnieuw opstellen. Heropen zo nodig ook eerdere betrokken maanden, van nieuw naar oud; na de correctie moet iedereen opnieuw bevestigen.',to_char(frozen,'MM-YYYY');
+ end if;
+end $$;
+revoke all on function cashgame_private.require_open_jackpot_month(date) from public,anon;
+grant execute on function cashgame_private.require_open_jackpot_month(date) to authenticated;
+
+create function cashgame_private.protect_confirmed_jackpot_data() returns trigger
+language plpgsql security invoker set search_path='' as $$
+declare d date;
+begin
+ if tg_op='UPDATE' and new is not distinct from old then return new;end if;
+ if tg_table_name='cashgame_sessions' then
+  if tg_op<>'INSERT' then perform cashgame_private.require_open_jackpot_month(old.session_date);end if;
+  if tg_op<>'DELETE' then perform cashgame_private.require_open_jackpot_month(new.session_date);end if;
+ elsif tg_table_name='cashgame_results' then
+  if tg_op<>'INSERT' then select session_date into d from public.cashgame_sessions where id=old.session_id;perform cashgame_private.require_open_jackpot_month(d);end if;
+  if tg_op<>'DELETE' then select session_date into d from public.cashgame_sessions where id=new.session_id;perform cashgame_private.require_open_jackpot_month(d);end if;
+ elsif tg_table_name='cashgame_jackpot_settings' then
+  if tg_op<>'INSERT' then perform cashgame_private.require_open_jackpot_month(old.start_date);end if;
+  if tg_op<>'DELETE' then perform cashgame_private.require_open_jackpot_month(new.start_date);end if;
+ elsif tg_table_name='cashgame_rakeback_sessions' then
+  if tg_op<>'INSERT' then select session_date into d from public.cashgame_sessions where id=old.session_id;perform cashgame_private.require_open_jackpot_month(d);end if;
+  if tg_op<>'DELETE' then select session_date into d from public.cashgame_sessions where id=new.session_id;perform cashgame_private.require_open_jackpot_month(d);end if;
+ elsif tg_table_name='cashgame_rakeback_actions' then
+  if tg_op='DELETE' or (tg_op='UPDATE' and (new.percentage is distinct from old.percentage or new.id is distinct from old.id)) then
+   for d in select s.session_date from public.cashgame_rakeback_sessions l join public.cashgame_sessions s on s.id=l.session_id where l.action_id=old.id loop
+    perform cashgame_private.require_open_jackpot_month(d);
+   end loop;
+  end if;
+ end if;
+ if tg_op='DELETE' then return old;else return new;end if;
+end $$;
+revoke all on function cashgame_private.protect_confirmed_jackpot_data() from public,anon;
+grant execute on function cashgame_private.protect_confirmed_jackpot_data() to authenticated;
+do $$ declare t text;begin
+ foreach t in array array['cashgame_sessions','cashgame_results','cashgame_jackpot_settings','cashgame_rakeback_actions','cashgame_rakeback_sessions'] loop
+ execute format('create trigger protect_confirmed_jackpot_data before insert or update or delete on public.%I for each row execute function cashgame_private.protect_confirmed_jackpot_data()',t);
+ end loop;
+end $$;
+
+create or replace function cashgame_private.jackpot_closed_month_guard() returns trigger
+language plpgsql security invoker set search_path='' as $$
+begin
+ if old.cancelled_at is null and new.cancelled_at is not null then
+  perform cashgame_private.require_open_jackpot_month(old.accounting_month);
+  if exists(select 1 from public.cashgame_month_settlements where month=old.accounting_month and status='completed') then
+   raise exception 'Deze uitbetaling is al verwerkt in een bevestigd maandoverzicht. Klik daar eerst op Opnieuw opstellen; na de correctie moet iedereen opnieuw bevestigen';
+  end if;
+ end if;
+ return new;
+end $$;
+
+CREATE OR REPLACE FUNCTION public.prepare_cashgame_month(p_month date)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+declare snap jsonb; person jsonb; later_month date;
+begin
+ if not public.is_cashgame_manager() or auth.uid() is null then raise exception 'Geen toegang'; end if;
+ if p_month<>date_trunc('month',p_month)::date or p_month>=date_trunc('month',now() at time zone 'Europe/Amsterdam')::date then raise exception 'Alleen een verlopen maand kan worden afgerond'; end if;
+ perform pg_advisory_xact_lock(769423);
+ select month into later_month from public.cashgame_month_settlements where month>p_month and status='completed' and snapshot?'jackpotCustody' and p_month>=(select date_trunc('month',start_date)::date from public.cashgame_jackpot_settings where id=1) order by month desc limit 1;
+ if later_month is not null then raise exception 'Heropen eerst jackpotmaand % via Opnieuw opstellen. Werk van nieuw naar oud; stel na de correctie de overzichten weer op van oud naar nieuw.',to_char(later_month,'MM-YYYY');end if;
+ snap:=cashgame_private.month_snapshot(p_month);
+ if (snap->>'pending')::int>0 or ((snap->>'count')::int=0 and coalesce((snap->>'jackpotPayoutCount')::int,0)=0 and coalesce((snap->>'jackpotReserved')::numeric,0)=0) then raise exception 'Vul eerst alle sessies volledig in'; end if;
+ if (select count(*) from jsonb_array_elements(snap->'balances'))<>(select count(distinct value->>'user_id') from jsonb_array_elements(snap->'balances')) then raise exception 'Iedere persoon moet een eigen loginaccount hebben'; end if;
+ for person in select value from jsonb_array_elements(snap->'balances') loop
+ if (person->>'logins')::int<>1 then raise exception 'Koppel precies één login aan elke persoon in de afrekening'; end if;
+ end loop;
+ insert into public.cashgame_month_settlements(month,snapshot) values(p_month,snap) on conflict(month) do update set snapshot=excluded.snapshot,status='pending',created_at=now(),completed_at=null;
+ delete from public.cashgame_month_approvals where month=p_month;
+ insert into public.cashgame_month_approvals(month,player_key,user_id) select p_month,value->>'key',(value->>'user_id')::uuid from jsonb_array_elements(snap->'balances');
+end $function$
+;
+notify pgrst,'reload schema';
