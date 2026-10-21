@@ -159,4 +159,119 @@ if exists(select 1 from public.cashgame_jackpot_contributions() c where c.sessio
  output:=output||jsonb_build_object('jackpotReserved',(select sum(c.amount_cents) from public.cashgame_jackpot_contributions() c where c.session_date>=p_month and c.session_date<p_month+interval '1 month'));
 end if;
 return output;
-end $function$
+end $function$;
+
+-- Evening host pays the prize; reimburse through the session month's settlement.
+alter table public.cashgame_jackpot_payouts add column payer_id text not null,add column accounting_month date not null;
+CREATE OR REPLACE FUNCTION cashgame_private.record_jackpot(p_id uuid, p_rule uuid, p_session text, p_winner text, p_note text, p_expected_amount bigint, p_expected_balance bigint)
+ RETURNS uuid
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+declare rule public.cashgame_jackpot_rules; game public.cashgame_sessions; balance bigint; amount bigint; left_amount bigint; take_amount bigint; holder record; allocations jsonb:='[]'; winner text;
+begin
+ if auth.uid() is null or not public.is_cashgame_manager() then raise exception 'Geen toegang'; end if;
+ perform pg_advisory_xact_lock(769423);
+ if exists(select 1 from public.cashgame_jackpot_payouts where id=p_id) then return p_id; end if;
+ select * into rule from public.cashgame_jackpot_rules where id=p_rule and active;
+ if not found then raise exception 'Deze handregel is niet actief'; end if;
+ select * into game from public.cashgame_sessions where id=p_session;
+ if not found or not exists(select 1 from public.cashgame_jackpot_settings cfg where game.session_date>=cfg.start_date and (cfg.end_date is null or game.session_date<=cfg.end_date)) or game.session_date>(now() at time zone 'Europe/Amsterdam')::date then raise exception 'Kies een gespeelde sessie binnen de jackpotperiode'; end if;
+ if btrim(coalesce(game.host_player_id,''))='' then raise exception 'Kies eerst de host van deze sessie'; end if;
+ if exists(select 1 from public.cashgame_month_settlements where month=date_trunc('month',game.session_date)::date and status='completed') then raise exception 'Deze sessiemaand is al bevestigd. Stel het maandoverzicht eerst opnieuw op om de jackpotuitbetaling te verwerken';end if;
+ select min(first_name) into winner from public.cashgame_results where session_id=p_session and player_id=p_winner;
+ if winner is null then raise exception 'Kies een deelnemer uit deze sessie'; end if;
+ if length(coalesce(p_note,''))>2000 then raise exception 'Toelichting is te lang'; end if;
+ select coalesce(sum(available),0) into balance from cashgame_private.jackpot_holdings();
+ amount:=case when rule.payout_type='fixed' then round(rule.payout_value*100) else floor(balance*rule.payout_value/100) end;
+ if amount<=0 or amount>balance then raise exception 'Onvoldoende jackpot voor deze uitbetaling'; end if;
+ if balance<>p_expected_balance or amount<>p_expected_amount then raise exception 'De jackpot of handregel is gewijzigd. Vernieuw en controleer de uitbetaling opnieuw'; end if;
+ left_amount:=amount;
+ for holder in select * from cashgame_private.jackpot_holdings() where available>0 order by available desc,host_id collate "C" loop
+  take_amount:=least(left_amount,holder.available);
+  if take_amount>0 then allocations:=allocations||jsonb_build_array(jsonb_build_object('host_id',holder.host_id,'amount_cents',take_amount));left_amount:=left_amount-take_amount;end if;
+  exit when left_amount=0;
+ end loop;
+ insert into public.cashgame_jackpot_payouts(id,session_id,session_date,session_code,winner_id,winner_name,rule_snapshot,amount_cents,balance_before,allocations,note,created_by,payer_id,accounting_month)
+ values(p_id,p_session,game.session_date,game.code,p_winner,winner,to_jsonb(rule),amount,balance,allocations,coalesce(p_note,''),auth.uid(),game.host_player_id,date_trunc('month',game.session_date)::date);
+ return p_id;
+end $function$;
+CREATE OR REPLACE FUNCTION cashgame_private.month_snapshot(p_month date)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+declare output jsonb;
+begin
+with sessions as(
+ select s.*, coalesce((select sum(round(r.tips*100)) from public.cashgame_results r where r.session_id=s.id),0) tips,
+ case when s.manual_start<>'' and s.ended_at<>'' then ceil(extract(epoch from(cashgame_private.jackpot_timestamp(s.ended_at)-cashgame_private.jackpot_timestamp(s.manual_start)))/60) end minutes
+ from public.cashgame_sessions s where s.session_date>=p_month and s.session_date<(p_month+interval '1 month')
+), fees as(
+ select s.*,case when minutes>=0 then round((13+3*ceil(greatest(0,minutes-180)/20))*20.99/115*100) end fee from sessions s
+), excluded as(
+ select * from fees where (btrim(host_player_id)<>'' and btrim(partner_player_id)='' and btrim(third_player_id)='') or (fee is not null and tips=fee)
+), reserved as(
+ select s.*,coalesce((select sum(floor(greatest(0,s.tips-s.fee)*a.percentage/100)) from public.cashgame_rakeback_sessions l join public.cashgame_rakeback_actions a on a.id=l.action_id where l.session_id=s.id),0) reserve,coalesce((select c.amount_cents from public.cashgame_jackpot_contributions() c where c.session_id=s.id),0) jackpot
+ from fees s where not exists(select 1 from excluded e where e.id=s.id)
+), valid as(
+ select s.*,tips-fee-reserve-jackpot remainder,case when third_player_id='' then 2 else 3 end n
+ from reserved s where host_player_id<>'' and partner_player_id<>'' and fee is not null and tips<>fee and reserve+jackpot<=greatest(0,tips-fee)
+), jackpot_payments as(
+ select * from public.cashgame_jackpot_payouts where accounting_month=p_month and cancelled_at is null
+), amounts as(
+ select host_player_id id,tips received,fee+reserve+jackpot+floor(remainder/n) entitled from valid
+ union all select partner_player_id,0,case when n=2 then remainder-floor(remainder/2) else floor(remainder/3)+case when (remainder-3*floor(remainder/3))>0 then 1 else 0 end end from valid
+ union all select third_player_id,0,floor(remainder/3)+case when (remainder-3*floor(remainder/3))>1 then 1 else 0 end from valid where n=3
+ union all select p.payer_id,0,p.amount_cents from jackpot_payments p
+ union all select a->>'host_id',0,-(a->>'amount_cents')::bigint from jackpot_payments p cross join lateral jsonb_array_elements(p.allocations) a
+), resolved as(
+ select a.*,coalesce('group:'||l.group_id,a.id) key from amounts a left join public.cashgame_player_links l on l.player_id=a.id
+), totals as(
+ select key,min(id) id,sum(received) received,sum(entitled) entitled from resolved group by key
+), people as(
+ select t.*,coalesce((select jsonb_agg(l.player_id order by l.player_id) from public.cashgame_player_links l where 'group:'||l.group_id=t.key),jsonb_build_array(t.id)) ids,
+ coalesce((select min(nullif(l.first_name,'')) from public.cashgame_player_links l where 'group:'||l.group_id=t.key),(select min(nullif(r.first_name,'')) from public.cashgame_results r where coalesce((select 'group:'||l.group_id from public.cashgame_player_links l where l.player_id=r.player_id),r.player_id)=t.key),'') first_name,
+ (select count(distinct b.user_id) from public.cashgame_login_links b where coalesce((select 'group:'||l.group_id from public.cashgame_player_links l where l.player_id=b.player_id),b.player_id)=t.key) logins,
+ (select min(b.user_id::text) from public.cashgame_login_links b where coalesce((select 'group:'||l.group_id from public.cashgame_player_links l where l.player_id=b.player_id),b.player_id)=t.key) user_id
+ from totals t
+)
+select jsonb_build_object('month',p_month,'count',(select count(*) from valid),'excluded',(select count(*) from excluded),'pending',(select count(*) from sessions)-(select count(*) from excluded)-(select count(*) from valid),'total',(select coalesce(sum(tips),0) from valid),'balances',coalesce((select jsonb_agg(jsonb_build_object('key',key,'name',id,'ids',ids,'firstName',first_name,'received',received,'entitled',entitled,'balance',entitled-received,'logins',logins,'user_id',user_id) order by key) from people),'[]'::jsonb)) into output;
+if exists(select 1 from public.cashgame_jackpot_contributions() c where c.session_date>=p_month and c.session_date<p_month+interval '1 month') then
+ output:=output||jsonb_build_object('jackpotReserved',(select sum(c.amount_cents) from public.cashgame_jackpot_contributions() c where c.session_date>=p_month and c.session_date<p_month+interval '1 month'));
+end if;
+if exists(select 1 from public.cashgame_jackpot_payouts p where p.accounting_month=p_month and p.cancelled_at is null) then
+ output:=output||jsonb_build_object('jackpotPayouts',(select coalesce(jsonb_agg(jsonb_build_object('payer_id',p.payer_id,'amount_cents',p.amount_cents,'session_code',p.session_code,'allocations',p.allocations) order by p.created_at),'[]'::jsonb) from public.cashgame_jackpot_payouts p where p.accounting_month=p_month and p.cancelled_at is null),'jackpotPayoutCount',(select count(*) from public.cashgame_jackpot_payouts p where p.accounting_month=p_month and p.cancelled_at is null),'jackpotPayoutTotal',(select sum(amount_cents) from public.cashgame_jackpot_payouts p where p.accounting_month=p_month and p.cancelled_at is null));
+end if;
+return output;
+end $function$;
+CREATE OR REPLACE FUNCTION public.prepare_cashgame_month(p_month date)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+declare snap jsonb; person jsonb;
+begin
+ if not public.is_cashgame_manager() or auth.uid() is null then raise exception 'Geen toegang'; end if;
+ if p_month<>date_trunc('month',p_month)::date or p_month>=date_trunc('month',now() at time zone 'Europe/Amsterdam')::date then raise exception 'Alleen een verlopen maand kan worden afgerond'; end if;
+ perform pg_advisory_xact_lock(769423);
+ snap:=cashgame_private.month_snapshot(p_month);
+ if (snap->>'pending')::int>0 or ((snap->>'count')::int=0 and coalesce((snap->>'jackpotPayoutCount')::int,0)=0) then raise exception 'Vul eerst alle sessies volledig in'; end if;
+ if (select count(*) from jsonb_array_elements(snap->'balances'))<>(select count(distinct value->>'user_id') from jsonb_array_elements(snap->'balances')) then raise exception 'Iedere persoon moet een eigen loginaccount hebben'; end if;
+ for person in select value from jsonb_array_elements(snap->'balances') loop
+ if (person->>'logins')::int<>1 then raise exception 'Koppel precies één login aan elke persoon in de afrekening'; end if;
+ end loop;
+ insert into public.cashgame_month_settlements(month,snapshot) values(p_month,snap) on conflict(month) do update set snapshot=excluded.snapshot,status='pending',created_at=now(),completed_at=null;
+ delete from public.cashgame_month_approvals where month=p_month;
+ insert into public.cashgame_month_approvals(month,player_key,user_id) select p_month,value->>'key',(value->>'user_id')::uuid from jsonb_array_elements(snap->'balances');
+end $function$;
+create function cashgame_private.jackpot_closed_month_guard() returns trigger language plpgsql security invoker set search_path='' as $$
+begin
+ if old.cancelled_at is null and new.cancelled_at is not null and exists(select 1 from public.cashgame_month_settlements where month=old.accounting_month and status='completed') then raise exception 'Deze uitbetaling is al in een bevestigd maandoverzicht verwerkt. Stel dat overzicht eerst opnieuw op voor een correctie';end if;
+ return new;
+end $$;
+create trigger jackpot_closed_month_guard before update on public.cashgame_jackpot_payouts for each row execute function cashgame_private.jackpot_closed_month_guard();
+notify pgrst,'reload schema';
