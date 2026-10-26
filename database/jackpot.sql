@@ -474,3 +474,145 @@ begin
 end $function$
 ;
 notify pgrst,'reload schema';
+
+-- One-time jackpot seed from the three hosts' own shares: 10 points each; shown in monthly accounting.
+select pg_advisory_xact_lock(769423);
+create table public.cashgame_jackpot_seed(
+ id text primary key,player_id text not null unique,deposited_on date not null,amount_cents bigint not null check(amount_cents>0),description text not null
+);
+alter table public.cashgame_jackpot_seed enable row level security;
+revoke all on public.cashgame_jackpot_seed from anon,authenticated;
+grant select on public.cashgame_jackpot_seed to authenticated;
+create policy jackpot_seed_hosts on public.cashgame_jackpot_seed for select to authenticated using((select public.is_cashgame_manager()));
+insert into public.cashgame_jackpot_seed(id,player_id,deposited_on,amount_cents,description)
+values ('opening_20261026_barry','#3QPDQ','2026-10-26',1000,'Eenmalig beginsaldo · eigen storting Barry'),
+('opening_20261026_daniel','#36CMN','2026-10-26',1000,'Eenmalig beginsaldo · eigen storting Daniël'),
+('opening_20261026_roderick','#DCVZV','2026-10-26',1000,'Eenmalig beginsaldo · eigen storting Roderick')
+on conflict(id) do nothing;
+do $$ begin if (select count(*) from public.cashgame_jackpot_seed)<>3 or (select sum(amount_cents) from public.cashgame_jackpot_seed)<>3000 then raise exception 'Het beginsaldo moet precies drie stortingen van Pts 10 bevatten';end if;end $$;
+create function cashgame_private.jackpot_funding() returns table(host_id text,session_date date,amount_cents bigint)
+language sql stable security invoker set search_path='' as $$
+select c.host_id,c.session_date,c.amount_cents from public.cashgame_jackpot_contributions() c
+union all select s.player_id,s.deposited_on,s.amount_cents from public.cashgame_jackpot_seed s;
+$$;
+revoke all on function cashgame_private.jackpot_funding() from public,anon;
+grant execute on function cashgame_private.jackpot_funding() to authenticated;
+CREATE OR REPLACE FUNCTION cashgame_private.jackpot_holdings()
+ RETURNS TABLE(host_id text, available bigint)
+ LANGUAGE sql
+ STABLE
+ SET search_path TO ''
+AS $function$
+ with movements as (
+ select c.host_id,c.amount_cents amount from cashgame_private.jackpot_funding() c
+ union all select a->>'host_id',-(a->>'amount_cents')::bigint from public.cashgame_jackpot_payouts p cross join lateral jsonb_array_elements(p.allocations) a where p.cancelled_at is null
+ ) select m.host_id,sum(amount)::bigint from movements m group by m.host_id;
+$function$
+;
+CREATE OR REPLACE FUNCTION cashgame_private.jackpot_month_custody(p_month date)
+ RETURNS TABLE(host_id text, opening bigint, collected bigint, released bigint, closing bigint, adjustment bigint)
+ LANGUAGE sql
+ STABLE
+ SET search_path TO ''
+AS $function$
+ with cfg as(select array_agg(id order by id collate "C") host_ids from (select min(l.player_id) id from public.profiles p join public.cashgame_login_links l on l.user_id=p.id where p.role='admin' or exists(select 1 from public.cashgame_host_access h where h.user_id=p.id) group by p.id) hosts),
+ totals as(
+ select coalesce(sum(c.amount_cents) filter(where c.session_date<p_month),0)-(select coalesce(sum(p.amount_cents),0) from public.cashgame_jackpot_payouts p where p.cancelled_at is null and p.accounting_month<p_month) opening,
+ coalesce(sum(c.amount_cents),0)-(select coalesce(sum(p.amount_cents),0) from public.cashgame_jackpot_payouts p where p.cancelled_at is null and p.accounting_month<p_month+interval '1 month') closing
+ from cashgame_private.jackpot_funding() c where c.session_date<p_month+interval '1 month'
+ ), roster as(select id,row_number() over(order by id collate "C") pos from cfg cross join unnest(host_ids) id),
+ deposits as(select c.host_id,sum(c.amount_cents)::bigint amount from cashgame_private.jackpot_funding() c where c.session_date>=p_month and c.session_date<p_month+interval '1 month' group by c.host_id),
+ releases as(select a->>'host_id' host_id,sum((a->>'amount_cents')::bigint)::bigint amount from public.cashgame_jackpot_payouts p cross join lateral jsonb_array_elements(p.allocations) a where p.cancelled_at is null and p.accounting_month=p_month group by a->>'host_id'),
+ ids as(select id from roster union select host_id from deposits union select host_id from releases),
+ custody_values as(select ids.id,case when r.id is not null then floor(t.opening/3)+case when r.pos<=mod(t.opening,3) then 1 else 0 end else 0 end::bigint opening,
+ coalesce(d.amount,0)::bigint collected,coalesce(e.amount,0)::bigint released,
+ case when r.id is not null then floor(t.closing/3)+case when r.pos<=mod(t.closing,3) then 1 else 0 end else 0 end::bigint closing
+ from ids cross join totals t left join roster r on r.id=ids.id left join deposits d on d.host_id=ids.id left join releases e on e.host_id=ids.id)
+ select id,opening,collected,released,closing,closing-opening-collected+released from custody_values
+ where (select count(*) from roster)=3 and (exists(select 1 from cashgame_private.jackpot_funding() c where c.session_date<p_month+interval '1 month')
+ or exists(select 1 from public.cashgame_jackpot_payouts p where p.cancelled_at is null and p.accounting_month<p_month+interval '1 month'));
+$function$
+;
+CREATE OR REPLACE FUNCTION cashgame_private.month_snapshot(p_month date)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+declare output jsonb;
+begin
+with sessions as(
+ select s.*, coalesce((select sum(round(r.tips*100)) from public.cashgame_results r where r.session_id=s.id),0) tips,
+ case when s.manual_start<>'' and s.ended_at<>'' then ceil(extract(epoch from(cashgame_private.jackpot_timestamp(s.ended_at)-cashgame_private.jackpot_timestamp(s.manual_start)))/60) end minutes
+ from public.cashgame_sessions s where s.session_date>=p_month and s.session_date<(p_month+interval '1 month')
+), fees as(
+ select s.*,case when minutes>=0 then round((13+3*ceil(greatest(0,minutes-180)/20))*20.99/115*100) end fee from sessions s
+), excluded as(
+ select * from fees where (btrim(host_player_id)<>'' and btrim(partner_player_id)='' and btrim(third_player_id)='') or (fee is not null and tips=fee)
+), reserved as(
+ select s.*,coalesce((select sum(floor(greatest(0,s.tips-s.fee)*a.percentage/100)) from public.cashgame_rakeback_sessions l join public.cashgame_rakeback_actions a on a.id=l.action_id where l.session_id=s.id),0) reserve,coalesce((select c.amount_cents from public.cashgame_jackpot_contributions() c where c.session_id=s.id),0) jackpot
+ from fees s where not exists(select 1 from excluded e where e.id=s.id)
+), valid as(
+ select s.*,tips-fee-reserve-jackpot remainder,case when third_player_id='' then 2 else 3 end n
+ from reserved s where host_player_id<>'' and partner_player_id<>'' and fee is not null and tips<>fee and reserve+jackpot<=greatest(0,tips-fee)
+), jackpot_payments as(
+ select * from public.cashgame_jackpot_payouts where accounting_month=p_month and cancelled_at is null
+), amounts as(
+ select host_player_id id,tips received,fee+reserve+jackpot+floor(remainder/n) entitled from valid
+ union all select partner_player_id,0,case when n=2 then remainder-floor(remainder/2) else floor(remainder/3)+case when (remainder-3*floor(remainder/3))>0 then 1 else 0 end end from valid
+ union all select third_player_id,0,floor(remainder/3)+case when (remainder-3*floor(remainder/3))>1 then 1 else 0 end from valid where n=3
+ union all select p.payer_id,0,p.amount_cents from jackpot_payments p
+ union all select a->>'host_id',0,-(a->>'amount_cents')::bigint from jackpot_payments p cross join lateral jsonb_array_elements(p.allocations) a
+ union all select c.host_id,0,c.adjustment from cashgame_private.jackpot_month_custody(p_month) c
+), resolved as(
+ select a.*,coalesce('group:'||l.group_id,a.id) key from amounts a left join public.cashgame_player_links l on l.player_id=a.id
+), totals as(
+ select key,min(id) id,sum(received) received,sum(entitled) entitled from resolved group by key
+), people as(
+ select t.*,coalesce((select jsonb_agg(l.player_id order by l.player_id) from public.cashgame_player_links l where 'group:'||l.group_id=t.key),jsonb_build_array(t.id)) ids,
+ coalesce((select min(nullif(l.first_name,'')) from public.cashgame_player_links l where 'group:'||l.group_id=t.key),(select min(nullif(r.first_name,'')) from public.cashgame_results r where coalesce((select 'group:'||l.group_id from public.cashgame_player_links l where l.player_id=r.player_id),r.player_id)=t.key),'') first_name,
+ (select count(distinct b.user_id) from public.cashgame_login_links b where coalesce((select 'group:'||l.group_id from public.cashgame_player_links l where l.player_id=b.player_id),b.player_id)=t.key) logins,
+ (select min(b.user_id::text) from public.cashgame_login_links b where coalesce((select 'group:'||l.group_id from public.cashgame_player_links l where l.player_id=b.player_id),b.player_id)=t.key) user_id
+ from totals t
+)
+select jsonb_build_object('month',p_month,'count',(select count(*) from valid),'excluded',(select count(*) from excluded),'pending',(select count(*) from sessions)-(select count(*) from excluded)-(select count(*) from valid),'total',(select coalesce(sum(tips),0) from valid),'balances',coalesce((select jsonb_agg(jsonb_build_object('key',key,'name',id,'ids',ids,'firstName',first_name,'received',received,'entitled',entitled,'balance',entitled-received,'logins',logins,'user_id',user_id) order by key) from people),'[]'::jsonb)) into output;
+if exists(select 1 from public.cashgame_jackpot_contributions() c where c.session_date>=p_month and c.session_date<p_month+interval '1 month') then
+ output:=output||jsonb_build_object('jackpotReserved',(select sum(c.amount_cents) from public.cashgame_jackpot_contributions() c where c.session_date>=p_month and c.session_date<p_month+interval '1 month'));
+end if;
+if exists(select 1 from public.cashgame_jackpot_payouts p where p.accounting_month=p_month and p.cancelled_at is null) then
+ output:=output||jsonb_build_object('jackpotPayouts',(select coalesce(jsonb_agg(jsonb_build_object('payer_id',p.payer_id,'amount_cents',p.amount_cents,'session_code',p.session_code,'allocations',p.allocations) order by p.created_at),'[]'::jsonb) from public.cashgame_jackpot_payouts p where p.accounting_month=p_month and p.cancelled_at is null),'jackpotPayoutCount',(select count(*) from public.cashgame_jackpot_payouts p where p.accounting_month=p_month and p.cancelled_at is null),'jackpotPayoutTotal',(select sum(amount_cents) from public.cashgame_jackpot_payouts p where p.accounting_month=p_month and p.cancelled_at is null));
+end if;
+if exists(select 1 from cashgame_private.jackpot_month_custody(p_month)) then
+ output:=output||jsonb_build_object('jackpotHosts',(select jsonb_agg(c.host_id order by c.host_id collate "C") from cashgame_private.jackpot_month_custody(p_month) c),'jackpotCustody',(select jsonb_agg(to_jsonb(c) order by c.host_id collate "C") from cashgame_private.jackpot_month_custody(p_month) c),'jackpotOpeningBalance',(select sum(c.opening) from cashgame_private.jackpot_month_custody(p_month) c),'jackpotClosingBalance',(select sum(c.closing) from cashgame_private.jackpot_month_custody(p_month) c),'jackpotCumulativeContributions',(select coalesce(sum(c.amount_cents),0) from public.cashgame_jackpot_contributions() c where c.session_date<p_month+interval '1 month'));
+end if;
+if exists(select 1 from public.cashgame_jackpot_seed s where s.deposited_on>=p_month and s.deposited_on<p_month+interval '1 month') then
+ output:=output||jsonb_build_object('jackpotSeeded',(select sum(s.amount_cents) from public.cashgame_jackpot_seed s where s.deposited_on>=p_month and s.deposited_on<p_month+interval '1 month'),'jackpotSeeds',(select jsonb_agg(to_jsonb(s) order by s.player_id) from public.cashgame_jackpot_seed s where s.deposited_on>=p_month and s.deposited_on<p_month+interval '1 month'));
+end if;
+return output;
+end $function$
+;
+CREATE OR REPLACE FUNCTION public.prepare_cashgame_month(p_month date)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+declare snap jsonb; person jsonb; later_month date;
+begin
+ if not public.is_cashgame_manager() or auth.uid() is null then raise exception 'Geen toegang'; end if;
+ if p_month<>date_trunc('month',p_month)::date or p_month>=date_trunc('month',now() at time zone 'Europe/Amsterdam')::date then raise exception 'Alleen een verlopen maand kan worden afgerond'; end if;
+ perform pg_advisory_xact_lock(769423);
+ select month into later_month from public.cashgame_month_settlements where month>p_month and status='completed' and snapshot?'jackpotCustody' and p_month>=(select date_trunc('month',start_date)::date from public.cashgame_jackpot_settings where id=1) order by month desc limit 1;
+ if later_month is not null then raise exception 'Heropen eerst jackpotmaand % via Opnieuw opstellen. Werk van nieuw naar oud; stel na de correctie de overzichten weer op van oud naar nieuw.',to_char(later_month,'MM-YYYY');end if;
+ snap:=cashgame_private.month_snapshot(p_month);
+ if (snap->>'pending')::int>0 or ((snap->>'count')::int=0 and coalesce((snap->>'jackpotPayoutCount')::int,0)=0 and coalesce((snap->>'jackpotReserved')::numeric,0)=0 and coalesce((snap->>'jackpotSeeded')::numeric,0)=0) then raise exception 'Vul eerst alle sessies volledig in'; end if;
+ if (select count(*) from jsonb_array_elements(snap->'balances'))<>(select count(distinct value->>'user_id') from jsonb_array_elements(snap->'balances')) then raise exception 'Iedere persoon moet een eigen loginaccount hebben'; end if;
+ for person in select value from jsonb_array_elements(snap->'balances') loop
+ if (person->>'logins')::int<>1 then raise exception 'Koppel precies één login aan elke persoon in de afrekening'; end if;
+ end loop;
+ insert into public.cashgame_month_settlements(month,snapshot) values(p_month,snap) on conflict(month) do update set snapshot=excluded.snapshot,status='pending',created_at=now(),completed_at=null;
+ delete from public.cashgame_month_approvals where month=p_month;
+ insert into public.cashgame_month_approvals(month,player_key,user_id) select p_month,value->>'key',(value->>'user_id')::uuid from jsonb_array_elements(snap->'balances');
+end $function$
+;
+notify pgrst,'reload schema';
