@@ -679,3 +679,51 @@ begin
 end $function$
 ;
 notify pgrst,'reload schema';
+-- Percentage basis: balance before the selected session
+CREATE OR REPLACE FUNCTION cashgame_private.jackpot_before_session(p_session text)
+RETURNS bigint LANGUAGE sql STABLE SECURITY INVOKER SET search_path TO '' AS $$
+select greatest(0,
+ coalesce((select sum(c.amount_cents) from public.cashgame_jackpot_contributions() c join public.cashgame_sessions s on s.id=c.session_id where (s.session_date,coalesce(s.manual_start,'')) < (g.session_date,coalesce(g.manual_start,''))),0)
+ +coalesce((select sum(amount_cents) from public.cashgame_jackpot_seed where deposited_on<=g.session_date),0)
+ -coalesce((select sum(p.amount_cents) from public.cashgame_jackpot_payouts p join public.cashgame_sessions s on s.id=p.session_id where p.cancelled_at is null and (s.session_date,coalesce(s.manual_start,'')) < (g.session_date,coalesce(g.manual_start,''))),0))
+from public.cashgame_sessions g where g.id=p_session;
+$$;
+REVOKE ALL ON FUNCTION cashgame_private.jackpot_before_session(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION cashgame_private.jackpot_before_session(text) TO authenticated;
+
+CREATE OR REPLACE FUNCTION cashgame_private.record_jackpot(p_id uuid, p_rule uuid, p_session text, p_winner text, p_note text, p_expected_amount bigint, p_expected_balance bigint)
+ RETURNS uuid
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+declare rule public.cashgame_jackpot_rules; game public.cashgame_sessions; balance bigint; amount bigint; left_amount bigint; take_amount bigint; holder record; allocations jsonb:='[]'; winner text;
+begin
+ if auth.uid() is null or not public.is_cashgame_manager() then raise exception 'Geen toegang'; end if;
+ perform pg_advisory_xact_lock(769423);
+ if exists(select 1 from public.cashgame_jackpot_payouts where id=p_id) then return p_id; end if;
+ select * into rule from public.cashgame_jackpot_rules where id=p_rule and active;
+ if not found then raise exception 'Deze handregel is niet actief'; end if;
+ select * into game from public.cashgame_sessions where id=p_session;
+ if not found or not exists(select 1 from public.cashgame_jackpot_settings cfg where game.session_date>=cfg.start_date and (cfg.end_date is null or game.session_date<=cfg.end_date)) or game.session_date>(now() at time zone 'Europe/Amsterdam')::date then raise exception 'Kies een gespeelde sessie binnen de jackpotperiode'; end if;
+ if not cashgame_private.jackpot_holdem_type(game.game_type) then raise exception 'Jackpotuitbetalingen zijn alleen toegestaan bij Speltype A';end if;
+ if btrim(coalesce(game.host_player_id,''))='' then raise exception 'Kies eerst de host van deze sessie'; end if;
+ if exists(select 1 from public.cashgame_month_settlements where month=date_trunc('month',game.session_date)::date and status='completed') then raise exception 'Deze sessiemaand is al bevestigd. Stel het maandoverzicht eerst opnieuw op om de jackpotuitbetaling te verwerken';end if;
+ select min(first_name) into winner from public.cashgame_results where session_id=p_session and player_id=p_winner;
+ if winner is null then raise exception 'Kies een deelnemer uit deze sessie'; end if;
+ if length(coalesce(p_note,''))>2000 then raise exception 'Toelichting is te lang'; end if;
+ select cashgame_private.jackpot_before_session(p_session) into balance;
+ amount:=case when rule.payout_type='fixed' then round(rule.payout_value*100) else floor(balance*rule.payout_value/100) end;
+ if amount<=0 or amount>balance or amount>(select coalesce(sum(available),0) from cashgame_private.jackpot_holdings()) then raise exception 'Onvoldoende jackpot voor deze uitbetaling'; end if;
+ if balance<>p_expected_balance or amount<>p_expected_amount then raise exception 'De jackpot of handregel is gewijzigd. Vernieuw en controleer de uitbetaling opnieuw'; end if;
+ left_amount:=amount;
+ for holder in select * from cashgame_private.jackpot_holdings() where available>0 order by available desc,host_id collate "C" loop
+  take_amount:=least(left_amount,holder.available);
+  if take_amount>0 then allocations:=allocations||jsonb_build_array(jsonb_build_object('host_id',holder.host_id,'amount_cents',take_amount));left_amount:=left_amount-take_amount;end if;
+  exit when left_amount=0;
+ end loop;
+ insert into public.cashgame_jackpot_payouts(id,session_id,session_date,session_code,winner_id,winner_name,rule_snapshot,amount_cents,balance_before,allocations,note,created_by,payer_id,accounting_month)
+ values(p_id,p_session,game.session_date,game.code,p_winner,winner,to_jsonb(rule),amount,balance,allocations,coalesce(p_note,''),auth.uid(),game.host_player_id,date_trunc('month',game.session_date)::date);
+ return p_id;
+end $function$
+;
